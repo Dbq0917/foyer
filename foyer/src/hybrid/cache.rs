@@ -268,6 +268,8 @@ pub type HybridCacheEntry<K, V, S = DefaultHasher> = CacheEntry<K, V, S, HybridC
 pub struct HybridCacheOptions {
     pub policy: HybridCachePolicy,
     pub flush_on_close: bool,
+    /// Optional startup warm-up configuration. `None` keeps the historical cold-start behavior.
+    pub warmup: Option<crate::hybrid::warmup::WarmupConfig>,
     #[cfg(feature = "tracing")]
     pub tracing_options: TracingOptions,
 }
@@ -277,6 +279,7 @@ impl Default for HybridCacheOptions {
         Self {
             policy: HybridCachePolicy::default(),
             flush_on_close: true,
+            warmup: None,
             #[cfg(feature = "tracing")]
             tracing_options: TracingOptions::default(),
         }
@@ -659,6 +662,62 @@ where
     /// Return `false` if the hybrid cache is running in in-memory mode but with hybrid cache compatible APIs.
     pub fn is_hybrid(&self) -> bool {
         self.inner.storage.is_enabled()
+    }
+
+    /// Warm the in-memory cache from the disk index with the default configuration.
+    ///
+    /// This enumerates the recovered disk index, loads the selected entries back from disk and
+    /// installs them into memory. It is safe to call while serving traffic; warm-up only inserts
+    /// entries and yields between disk loads.
+    ///
+    /// Use [`HybridCache::warmup_with`] to bound or configure the warm-up.
+    pub async fn warmup(&self) -> Result<crate::hybrid::warmup::WarmupReport> {
+        self.warmup_with(crate::hybrid::warmup::WarmupConfig::default()).await
+    }
+
+    /// Alias of [`HybridCache::warmup`] using the "warm up" spelling.
+    pub async fn warm_up(&self) -> Result<crate::hybrid::warmup::WarmupReport> {
+        self.warmup().await
+    }
+
+    /// Run warm-up with a custom configuration or a simple `bool` switch.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// # use foyer::HybridCache;
+    /// # async fn demo(cache: &HybridCache<u64, u64>) {
+    /// cache.warmup_with(true).await.unwrap();
+    /// cache.warmup_with(foyer::WarmupConfig::new().with_max_entries(1000)).await.unwrap();
+    /// # }
+    /// ```
+    pub async fn warmup_with(
+        &self,
+        config: impl crate::hybrid::warmup::IntoWarmupConfig,
+    ) -> Result<crate::hybrid::warmup::WarmupReport> {
+        use crate::hybrid::warmup::{WarmupReport, run_warmup};
+        let Some(config) = crate::hybrid::warmup::IntoWarmupConfig::into_warmup_config(config) else {
+            return Ok(WarmupReport::default());
+        };
+        run_warmup(&self.inner.memory, &self.inner.storage, config).await
+    }
+
+    /// Alias of [`HybridCache::warmup_with`] using the "warm up" spelling.
+    pub async fn warm_up_with(
+        &self,
+        config: impl crate::hybrid::warmup::IntoWarmupConfig,
+    ) -> Result<crate::hybrid::warmup::WarmupReport> {
+        self.warmup_with(config).await
+    }
+
+    /// Alias of [`HybridCache::warmup`].
+    pub async fn prewarm(&self) -> Result<crate::hybrid::warmup::WarmupReport> {
+        self.warmup().await
+    }
+
+    /// Alias of [`HybridCache::warmup`].
+    pub async fn preheat(&self) -> Result<crate::hybrid::warmup::WarmupReport> {
+        self.warmup().await
     }
 
     pub(crate) fn metrics(&self) -> &Arc<Metrics> {
@@ -1699,5 +1758,81 @@ mod tests {
 
         let eref = err.downcast_ref::<TestError>();
         assert_eq!(eref, Some(&e));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_warmup_startup_loads_hot_entries_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let hybrid = open_with(dir.path(), |builder| builder.with_warmup(true), |engine| engine).await;
+        for key in 0..64u64 {
+            hybrid.insert(key, vec![key as u8; 7 * KB]);
+        }
+        hybrid.close().await.unwrap();
+
+        let hybrid = open_with(dir.path(), |builder| builder.with_warmup(true), |engine| engine).await;
+        let memory_hits = (0..64u64).filter(|key| hybrid.memory().get(key).is_some()).count();
+        assert_eq!(memory_hits, 64);
+        for key in 0..64u64 {
+            assert_eq!(*hybrid.get(&key).await.unwrap().unwrap(), vec![key as u8; 7 * KB]);
+        }
+        hybrid.close().await.unwrap();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_warm_up_disabled_by_default_keeps_cold_start() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let hybrid = open(dir.path()).await;
+        for key in 0..32u64 {
+            hybrid.insert(key, vec![key as u8; 7 * KB]);
+        }
+        hybrid.close().await.unwrap();
+
+        let hybrid = open(dir.path()).await;
+        assert_eq!(hybrid.memory().entries(), 0);
+        // Data is still recoverable from disk even though memory is cold.
+        assert!(hybrid.get(&0).await.unwrap().is_some());
+        hybrid.close().await.unwrap();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_warmup_respects_max_entries_limit() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let hybrid = open(dir.path()).await;
+        for key in 0..80u64 {
+            hybrid.insert(key, vec![key as u8; KB]);
+        }
+        hybrid.close().await.unwrap();
+
+        let config = WarmupConfig::new().with_max_entries(8);
+        let hybrid = open_with(
+            dir.path(),
+            move |builder| builder.with_warmup_config(config),
+            |engine| engine,
+        )
+        .await;
+        assert!(hybrid.memory().entries() <= 8);
+        assert!(hybrid.memory().entries() >= 1);
+        hybrid.close().await.unwrap();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_warmup_explicit_method_loads_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let hybrid = open(dir.path()).await;
+        hybrid.insert(1, vec![1u8; 7 * KB]);
+        hybrid.insert(2, vec![2u8; 7 * KB]);
+        hybrid.flush_if(|_, _| true).await;
+        hybrid.storage().wait().await;
+        hybrid.memory().clear();
+        assert_eq!(hybrid.memory().entries(), 0);
+
+        let report = hybrid.warmup().await.unwrap();
+        assert!(report.loaded >= 2, "report: {report:?}");
+        assert!(hybrid.memory().get(&1).is_some());
+        assert!(hybrid.memory().get(&2).is_some());
+        hybrid.close().await.unwrap();
     }
 }

@@ -103,6 +103,24 @@ impl<K, V, P> Load<K, V, P> {
     }
 }
 
+/// A live disk-cache entry enumerated from the recovered index.
+///
+/// It serves as a candidate for startup warm-up. The entry is identified by its key hash; the
+/// actual key and value can be loaded via [`Engine::load`] / [`crate::Store::load_by_hash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WarmupEntry {
+    /// The key hash of the entry.
+    pub hash: u64,
+    /// The monotonically increasing sequence of the entry.
+    ///
+    /// Higher values generally mean the entry was written more recently, which can be used as a
+    /// recency hint when deciding which entries to warm first.
+    pub sequence: u64,
+    /// The on-device encoded length of the entry, as a size hint.
+    pub size: usize,
+}
+
 /// The recover mode of the disk cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -202,6 +220,14 @@ where
     ///
     /// `contains` may return a false-positive result if there is a hash collision with the given key.
     fn may_contains(&self, hash: u64) -> bool;
+
+    /// Enumerate the live indexed entries that can be loaded for startup warm-up.
+    ///
+    /// Engines that do not maintain an enumerable index return an empty vector, which makes
+    /// warm-up a no-op. The default implementation returns an empty vector.
+    fn warmup_entries(&self) -> Vec<WarmupEntry> {
+        Vec::new()
+    }
 
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;

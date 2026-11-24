@@ -183,6 +183,27 @@ impl Indexer {
         }
     }
 
+    /// Enumerate all live (non-tombstone) entry addresses currently held by the indexer.
+    ///
+    /// The returned addresses are unordered. Callers that need a specific order (e.g. warm-up
+    /// priority) should sort the result themselves.
+    pub fn entries(&self) -> Vec<HashedEntryAddress> {
+        let mut entries = Vec::new();
+        for shard in self.shards.iter() {
+            let shard = shard.read();
+            entries.reserve(shard.len());
+            for (hash, index) in shard.iter() {
+                if let Index::Address(address) = index {
+                    entries.push(HashedEntryAddress {
+                        hash: *hash,
+                        address: address.clone(),
+                    });
+                }
+            }
+        }
+        entries
+    }
+
     #[cfg_attr(
         feature = "tracing",
         fastrace::trace(name = "foyer::storage::block::indexer::remove")

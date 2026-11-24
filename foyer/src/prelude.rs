@@ -33,6 +33,10 @@ pub use crate::{
     hybrid::{
         builder::{HybridCacheBuilder, HybridCacheBuilderPhaseMemory, HybridCacheBuilderPhaseStorage},
         cache::{HybridCache, HybridCacheEntry, HybridCachePolicy, HybridCacheProperties, HybridGet, HybridGetOrFetch},
+        warmup::{
+            IntoWarmupConfig, WarmUpConfig, WarmUpOptions, WarmupConfig, WarmupOptions, WarmupReport, WarmupResult,
+            WarmupStats,
+        },
         writer::{HybridCacheStorageWriter, HybridCacheWriter},
     },
     memory::{
@@ -45,6 +49,6 @@ pub use crate::{
         FileDeviceBuilder, FsDeviceBuilder, InvalidRatioPicker, IoEngine, IoEngineBuildContext, IoEngineConfig,
         IoHandle, IopsCounter, Load, NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder,
         PieceRef, PsyncIoEngine, PsyncIoEngineConfig, RawFile, RecoverMode, RejectAll, Statistics, StorageFilter,
-        StorageFilterCondition, StorageFilterResult, Store, StoreBuilder, Throttle,
+        StorageFilterCondition, StorageFilterResult, Store, StoreBuilder, Throttle, WarmupEntry,
     },
 };

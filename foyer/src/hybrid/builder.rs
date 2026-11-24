@@ -31,6 +31,60 @@ use crate::hybrid::cache::{
     HybridCache, HybridCacheOptions, HybridCachePipe, HybridCachePolicy, HybridCacheProperties,
 };
 
+macro_rules! warmup_named_setters {
+    () => {
+        /// Bound warm-up to the given fraction (`0.0..=1.0`) of the memory capacity.
+        pub fn with_warmup_ratio(mut self, ratio: f64) -> Self {
+            let config = self
+                .options
+                .warmup
+                .get_or_insert_with(crate::hybrid::warmup::WarmupConfig::default);
+            config.memory_ratio = ratio.clamp(0.0, 1.0);
+            self
+        }
+
+        /// Alias of `with_warmup_ratio` using the "warm up" spelling.
+        pub fn with_warm_up_ratio(self, ratio: f64) -> Self {
+            self.with_warmup_ratio(ratio)
+        }
+
+        /// Alias of `with_warmup_ratio`.
+        pub fn with_warmup_memory_ratio(self, ratio: f64) -> Self {
+            self.with_warmup_ratio(ratio)
+        }
+
+        /// Cap the number of entries warmed into memory.
+        pub fn with_warmup_max_entries(mut self, max_entries: usize) -> Self {
+            let config = self
+                .options
+                .warmup
+                .get_or_insert_with(crate::hybrid::warmup::WarmupConfig::default);
+            config.max_entries = Some(max_entries);
+            self
+        }
+
+        /// Alias of `with_warmup_max_entries`.
+        pub fn with_max_warmup_entries(self, max_entries: usize) -> Self {
+            self.with_warmup_max_entries(max_entries)
+        }
+
+        /// Alias of `with_warmup_max_entries`.
+        pub fn with_warmup_limit(self, max_entries: usize) -> Self {
+            self.with_warmup_max_entries(max_entries)
+        }
+
+        /// Alias of `with_warmup_max_entries`.
+        pub fn with_warmup_count(self, max_entries: usize) -> Self {
+            self.with_warmup_max_entries(max_entries)
+        }
+
+        /// Alias of `with_warmup_config` using the "warm up" spelling.
+        pub fn with_warm_up_config(self, config: crate::hybrid::warmup::WarmupConfig) -> Self {
+            self.with_warmup_config(config)
+        }
+    };
+}
+
 /// Hybrid cache builder.
 pub struct HybridCacheBuilder<K, V> {
     name: Cow<'static, str>,
@@ -103,6 +157,71 @@ impl<K, V> HybridCacheBuilder<K, V> {
         self
     }
 
+    /// Enable startup warm-up from the recovered disk index.
+    ///
+    /// Accepts `true`/`false` (boolean enables with the default configuration), a
+    /// [`crate::WarmupConfig`], or an `Option<WarmupConfig>`.
+    ///
+    /// When not called (or called with `false`), the cache starts cold and behaves exactly as
+    /// before.
+    pub fn with_warmup(mut self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.options.warmup = crate::hybrid::warmup::IntoWarmupConfig::into_warmup_config(warmup);
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilder::with_warmup`] using the "warm up" spelling.
+    pub fn with_warm_up(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Set the startup warm-up configuration explicitly.
+    pub fn with_warmup_config(mut self, config: crate::hybrid::warmup::WarmupConfig) -> Self {
+        self.options.warmup = Some(config);
+        self
+    }
+
+    /// Set the startup warm-up configuration (alias using the "options" naming).
+    pub fn with_warmup_options(mut self, options: crate::hybrid::warmup::WarmupOptions) -> Self {
+        self.options.warmup = Some(options);
+        self
+    }
+
+    /// Enable startup warm-up with the default configuration.
+    pub fn warmup(mut self) -> Self {
+        self.options.warmup = Some(crate::hybrid::warmup::WarmupConfig::default());
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilder::warmup`] using the "warm up" spelling.
+    pub fn warm_up(self) -> Self {
+        self.warmup()
+    }
+
+    /// Enable startup warm-up with the default configuration.
+    pub fn enable_warmup(self) -> Self {
+        self.warmup()
+    }
+
+    /// Alias of [`HybridCacheBuilder::with_warmup`] that emphasizes startup timing.
+    pub fn with_startup_warmup(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Alias of [`HybridCacheBuilder::with_warmup`] that emphasizes startup timing.
+    pub fn with_warmup_on_startup(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Alias of [`HybridCacheBuilder::with_warmup`] using the "prewarm" naming.
+    pub fn with_prewarm(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Alias of [`HybridCacheBuilder::with_warmup`] using the "preheat" naming.
+    pub fn with_preheat(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
     /// Set metrics registry.
     ///
     /// Default: [`NoopMetricsRegistry`].
@@ -110,6 +229,8 @@ impl<K, V> HybridCacheBuilder<K, V> {
         self.registry = registry;
         self
     }
+
+    warmup_named_setters!();
 
     /// Continue to modify the in-memory cache configurations.
     pub fn memory(self, capacity: usize) -> HybridCacheBuilderPhaseMemory<K, V, DefaultHasher>
@@ -223,6 +344,38 @@ where
         }
     }
 
+    /// Enable startup warm-up from the recovered disk index.
+    ///
+    /// Accepts `true`/`false`, a [`crate::WarmupConfig`], or an `Option<WarmupConfig>`.
+    pub fn with_warmup(mut self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.options.warmup = crate::hybrid::warmup::IntoWarmupConfig::into_warmup_config(warmup);
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilderPhaseMemory::with_warmup`] using the "warm up" spelling.
+    pub fn with_warm_up(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Set the startup warm-up configuration explicitly.
+    pub fn with_warmup_config(mut self, config: crate::hybrid::warmup::WarmupConfig) -> Self {
+        self.options.warmup = Some(config);
+        self
+    }
+
+    /// Enable startup warm-up with the default configuration.
+    pub fn warmup(mut self) -> Self {
+        self.options.warmup = Some(crate::hybrid::warmup::WarmupConfig::default());
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilderPhaseMemory::warmup`] using the "warm up" spelling.
+    pub fn warm_up(self) -> Self {
+        self.warmup()
+    }
+
+    warmup_named_setters!();
+
     /// Continue to modify the disk cache configurations.
     pub fn storage(self) -> HybridCacheBuilderPhaseStorage<K, V, S> {
         let memory = self.builder.build();
@@ -298,6 +451,39 @@ where
         }
     }
 
+    /// Enable startup warm-up from the recovered disk index.
+    ///
+    /// Accepts `true`/`false`, a [`crate::WarmupConfig`], or an `Option<WarmupConfig>`.
+    pub fn with_warmup(mut self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.options.warmup = crate::hybrid::warmup::IntoWarmupConfig::into_warmup_config(warmup);
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilderPhaseStorage::with_warmup`] using the "warm up" spelling.
+    pub fn with_warm_up(self, warmup: impl crate::hybrid::warmup::IntoWarmupConfig) -> Self {
+        self.with_warmup(warmup)
+    }
+
+    /// Set the startup warm-up configuration explicitly.
+    pub fn with_warmup_config(mut self, config: crate::hybrid::warmup::WarmupConfig) -> Self {
+        self.options.warmup = Some(config);
+        self
+    }
+
+    /// Enable startup warm-up with the default configuration.
+    pub fn warmup(mut self) -> Self {
+        self.options.warmup = Some(crate::hybrid::warmup::WarmupConfig::default());
+        self
+    }
+
+    /// Alias of [`HybridCacheBuilderPhaseStorage::warmup`] using the "warm up" spelling.
+    pub fn warm_up(mut self) -> Self {
+        self.options.warmup = Some(crate::hybrid::warmup::WarmupConfig::default());
+        self
+    }
+
+    warmup_named_setters!();
+
     /// Set the compression algorithm of the disk cache store.
     ///
     /// Default: [`Compression::None`].
@@ -333,6 +519,7 @@ where
     /// Build and open the hybrid cache with the given configurations.
     pub async fn build(self) -> Result<HybridCache<K, V, S>> {
         let builder = self.builder;
+        let warmup = self.options.warmup;
 
         let piped = match (builder.is_noop(), self.options.policy) {
             // noop storage; do nothing
@@ -344,6 +531,13 @@ where
         };
 
         let storage = builder.build().await?;
+
+        // Run startup warm-up before attaching the eviction pipe and before returning the cache, so:
+        // 1. immediate reads after `build()` already hit the in-memory layer, and
+        // 2. warm-up inserts never trigger eviction-driven disk writes through the pipe.
+        if let Some(config) = warmup {
+            crate::hybrid::warmup::run_warmup(&self.memory, &storage, config).await?;
+        }
 
         let memory = if piped {
             self.memory.with_pipe(Arc::new(HybridCachePipe::new(storage.clone())))

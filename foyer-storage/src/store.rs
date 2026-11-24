@@ -30,7 +30,7 @@ use crate::{
     StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
+        Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode, WarmupEntry,
         noop::{NoopEngine, NoopEngineConfig},
     },
     io::{
@@ -259,6 +259,24 @@ where
     {
         let hash = self.inner.hasher.hash_one(key);
         self.inner.keeper.contains(hash, key) || self.inner.engine.may_contains(hash)
+    }
+
+    /// Enumerate the live entries in the disk index as startup warm-up candidates.
+    ///
+    /// The result is unordered and empty for engines that do not expose an enumerable index.
+    pub fn warmup_entries(&self) -> Vec<WarmupEntry> {
+        self.inner.engine.warmup_entries()
+    }
+
+    /// Load an entry from the disk cache by its key hash, without key-equivalence checking.
+    ///
+    /// This is intended for startup warm-up, where the hashes are sourced from the recovered disk
+    /// index and no query key is available. Prefer [`Store::load`] for normal reads.
+    ///
+    /// Unlike [`Store::load`], this bypasses the in-memory write queue (`keeper`) and does not
+    /// record user-facing hit/miss metrics, so warm-up does not distort read statistics.
+    pub async fn load_by_hash(&self, hash: u64) -> Result<Load<K, V, P>> {
+        self.inner.engine.load(hash).await
     }
 
     /// Delete all cached entries of the disk cache.
@@ -524,6 +542,44 @@ mod tests {
             .build()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_warmup_entries_enumerate_and_load_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::noop());
+        let memory: Cache<u64, Vec<u8>> = CacheBuilder::new(100).build();
+
+        let store = StoreBuilder::new("test", memory.clone(), metrics)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(dir.path())
+                        .with_capacity(4 * 1024 * 1024)
+                        .build()
+                        .unwrap(),
+                )
+                .with_block_size(16 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        for index in 0..12u64 {
+            let entry = memory.insert(index, vec![index as u8; 256]);
+            store.enqueue(entry.piece(), true);
+        }
+        store.wait().await;
+
+        let candidates = store.warmup_entries();
+        assert!(candidates.len() >= 10, "candidates: {}", candidates.len());
+
+        let candidate = candidates.first().copied().unwrap();
+        let loaded = store.load_by_hash(candidate.hash).await.unwrap();
+        assert!(
+            matches!(loaded, Load::Entry { .. } | Load::Piece { .. }),
+            "warm-up candidate must be loadable: {loaded:?}"
+        );
     }
 
     #[tokio::test]

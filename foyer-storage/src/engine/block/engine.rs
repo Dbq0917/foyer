@@ -52,7 +52,7 @@ use crate::{
     Device, Load, RejectAll, Statistics, StorageFilter, StorageFilterResult,
     compress::Compression,
     engine::{
-        Engine, EngineBuildContext, EngineConfig, Populated,
+        Engine, EngineBuildContext, EngineConfig, Populated, WarmupEntry,
         block::{
             eviction::{EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{BlockId, BlockManager},
@@ -842,6 +842,19 @@ where
 
     fn may_contains(&self, hash: u64) -> bool {
         self.may_contains(hash)
+    }
+
+    fn warmup_entries(&self) -> Vec<WarmupEntry> {
+        self.inner
+            .indexer
+            .entries()
+            .into_iter()
+            .map(|entry| WarmupEntry {
+                hash: entry.hash,
+                sequence: entry.address.sequence,
+                size: entry.address.len as usize,
+            })
+            .collect()
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
