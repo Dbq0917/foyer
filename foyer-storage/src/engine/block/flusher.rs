@@ -447,8 +447,10 @@ where
             Submission::Reinsertion { reinsertion } => {
                 // Skip reinsertion if the entry is not in the indexer.
                 if self.indexer.get(reinsertion.hash).is_some() {
+                    let start = reinsertion.offset;
+                    let end = start + reinsertion.len;
                     report(self.buffer.as_mut().unwrap().push_slice(
-                        &reinsertion.slice[..reinsertion.len],
+                        &reinsertion.slice[start..end],
                         reinsertion.hash,
                         reinsertion.sequence,
                     ));

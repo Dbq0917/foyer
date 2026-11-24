@@ -15,7 +15,6 @@
 use std::{fmt::Debug, sync::Arc};
 
 use foyer_common::{
-    bits,
     code::{StorageKey, StorageValue},
     error::Result,
     properties::Properties,
@@ -136,8 +135,9 @@ where
                 };
                 for info in infos {
                     if reinsertion_picker.filter(&statistics, info.hash, info.addr.len as _).is_admitted() {
-                        let buf = IoSliceMut::new(bits::align_up(PAGE, info.addr.len as _));
-                        let (buf, res) = block.read(Box::new(buf), info.addr.offset as _).await;
+                        let (read_offset, read_len, entry_offset) = info.addr.read_range();
+                        let buf = IoSliceMut::new(read_len);
+                        let (buf, res) = block.read(Box::new(buf), read_offset as _).await;
                         if let Err(e) = res {
                             tracing::warn!(
                                     "[reclaimer]: error raised when reclaiming block {id}, skip the subsequent entries, err: {e}",
@@ -146,11 +146,12 @@ where
                             break 'reinsert;
                         }
                         let buf = buf.try_into_io_slice_mut().unwrap().into_io_slice();
-                        let slice = buf.slice(..bits::align_up(PAGE, info.addr.len as usize));
+                        let slice = buf.slice(..read_len);
                         let flusher = flushers[picked_count % flushers.len()].clone();
                         flusher.submit(Submission::Reinsertion {
                             reinsertion: Reinsertion {
                                 hash: info.hash,
+                                offset: entry_offset,
                                 len: info.addr.len as usize,
                                 sequence: info.addr.sequence,
                                 slice,
@@ -202,6 +203,7 @@ impl BlockCleaner {
 #[derive(Debug)]
 pub struct Reinsertion {
     pub hash: u64,
+    pub offset: usize,
     pub len: usize,
     pub sequence: Sequence,
     pub slice: IoSlice,

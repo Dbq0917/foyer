@@ -39,9 +39,9 @@ pub struct BlobEntryIndex {
     pub hash: u64,
     /// Entry sequence.
     pub sequence: Sequence,
-    /// Offset to the blob.
+    /// Byte offset to the block.
     pub offset: u32,
-    /// Page Length of the entry.
+    /// Serialized entry length.
     pub len: u32,
 }
 
@@ -68,10 +68,6 @@ impl BlobEntryIndex {
             offset,
             len,
         }
-    }
-
-    pub fn aligned(&self) -> usize {
-        bits::align_up(PAGE, self.len as _)
     }
 }
 
@@ -159,12 +155,6 @@ pub struct BufferEntryInfo {
     pub len: usize,
 }
 
-impl BufferEntryInfo {
-    pub fn aligned(&self) -> usize {
-        bits::align_up(PAGE, self.len)
-    }
-}
-
 #[derive(Debug)]
 pub struct Buffer {
     bytes: IoSliceMut,
@@ -198,18 +188,22 @@ impl Buffer {
     {
         tracing::trace!(hash, "[blob writer]: push");
 
-        let offset = self.written;
-        let buf = &mut self.bytes[offset..];
-
-        // If there is no space even for entry header, skip
-        if buf.len() < EntryHeader::serialized_len() {
+        let mut offset = self.written;
+        if self.bytes.len().saturating_sub(offset) < EntryHeader::serialized_len() {
+            offset = bits::align_up(PAGE, offset);
+        }
+        if offset + EntryHeader::serialized_len() > self.bytes.len() {
             return false;
         }
 
         let ser = Instant::now();
 
-        let info = match EntrySerializer::serialize(key, value, compression, &mut buf[EntryHeader::serialized_len()..])
-        {
+        let info = match EntrySerializer::serialize(
+            key,
+            value,
+            compression,
+            &mut self.bytes[offset + EntryHeader::serialized_len()..],
+        ) {
             Ok(info) => info,
             Err(e) => {
                 if e.kind() != ErrorKind::BufferSizeLimit {
@@ -218,10 +212,21 @@ impl Buffer {
                 return false;
             }
         };
-        let checksum = Checksummer::checksum64(
-            &buf[EntryHeader::serialized_len()
-                ..EntryHeader::serialized_len() + info.key_len as usize + info.value_len as usize],
-        );
+        let len = EntryHeader::serialized_len() + info.key_len as usize + info.value_len as usize;
+
+        // Keep small entries within a single page, so packing does not increase read amplification. Entries larger
+        // than a page still start at a page boundary and keep the same read behavior as before.
+        let start = Self::entry_start(offset, len);
+        let aligned = bits::align_up(PAGE, len);
+        if aligned > self.max_entry_size || start + len > self.bytes.len() {
+            return false;
+        }
+
+        if start != offset {
+            self.bytes.copy_within(offset..offset + len, start);
+        }
+
+        let checksum = Checksummer::checksum64(&self.bytes[start + EntryHeader::serialized_len()..start + len]);
         let header = EntryHeader {
             key_len: info.key_len as _,
             value_len: info.value_len as _,
@@ -230,27 +235,20 @@ impl Buffer {
             checksum,
             compression,
         };
-        header.write(&mut buf[..EntryHeader::serialized_len()]);
+        header.write(&mut self.bytes[start..start + EntryHeader::serialized_len()]);
 
         self.metrics
             .storage_entry_serialize_duration
             .record(ser.elapsed().as_secs_f64());
 
-        let len = EntryHeader::serialized_len() + info.key_len as usize + info.value_len as usize;
-        let aligned = bits::align_up(PAGE, len);
-
-        if aligned > self.max_entry_size {
-            return false;
-        }
-
         let info = BufferEntryInfo {
             hash,
             sequence,
-            offset,
+            offset: start,
             len,
         };
         self.entry_infos.push(info);
-        self.written += aligned;
+        self.written = start + len;
 
         tracing::trace!(hash, "[blob writer]: push finish");
 
@@ -261,30 +259,41 @@ impl Buffer {
     pub fn push_slice(&mut self, slice: &[u8], hash: u64, sequence: Sequence) -> bool {
         tracing::trace!(hash, "[blob writer]: push slice");
 
-        let offset = self.written;
-        let buf = &mut self.bytes[offset..];
-
         let len = slice.len();
         let aligned = bits::align_up(PAGE, slice.len());
+        let start = Self::entry_start(self.written, len);
 
-        if aligned > self.max_entry_size || aligned > buf.len() {
+        if aligned > self.max_entry_size || start + len > self.bytes.len() {
             return false;
         }
 
-        buf[..slice.len()].copy_from_slice(slice);
+        self.bytes[start..start + len].copy_from_slice(slice);
 
         let info = BufferEntryInfo {
             hash,
             sequence,
-            offset,
+            offset: start,
             len,
         };
         self.entry_infos.push(info);
-        self.written += aligned;
+        self.written = start + len;
 
         tracing::trace!(hash, "[blob writer]: push slice finish");
 
         true
+    }
+
+    fn entry_start(written: usize, len: usize) -> usize {
+        if len <= PAGE {
+            let page_start = bits::align_down(PAGE, written);
+            if written - page_start + len <= PAGE {
+                written
+            } else {
+                page_start + PAGE
+            }
+        } else {
+            bits::align_up(PAGE, written)
+        }
     }
 
     pub fn finish(self) -> (IoSliceMut, Vec<BufferEntryInfo>) {
@@ -320,7 +329,7 @@ impl SplitCtx {
 pub struct Splitter;
 
 impl Splitter {
-    pub fn split(ctx: &mut SplitCtx, mut bytes: IoSlice, entry_infos: Vec<BufferEntryInfo>) -> Batch {
+    pub fn split(ctx: &mut SplitCtx, bytes: IoSlice, entry_infos: Vec<BufferEntryInfo>) -> Batch {
         let mut batch = Batch {
             blocks: vec![Block { blob_parts: vec![] }],
             bytes: bytes.clone(),
@@ -331,8 +340,9 @@ impl Splitter {
             "[splitter] Blob index writer cannot be full at this point, it is supposed to be flushed in the last batch."
         );
 
-        let mut part_size = 0;
         let mut indices = vec![];
+        let mut part_start = None;
+        let mut part_end = 0;
 
         for info in entry_infos.into_iter() {
             tracing::trace!(?info, "[splitter]: handle entry");
@@ -340,27 +350,44 @@ impl Splitter {
             'handle: loop {
                 // Split blob if blob index is full.
                 if ctx.current_blob_index.is_full() {
-                    if let Some(part) = Self::split_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
-                        batch.blocks.last_mut().unwrap().blob_parts.push(part);
-                    }
+                    Self::seal_part(
+                        ctx,
+                        &mut batch,
+                        &bytes,
+                        &mut indices,
+                        &mut part_start,
+                        &mut part_end,
+                        true,
+                    );
                     continue 'handle;
                 }
 
+                let start = part_start.unwrap_or_else(|| bits::align_down(PAGE, info.offset));
+                let part_len = bits::align_up(PAGE, info.offset - start + info.len);
+
                 // Split blob and block if block is full.
-                if ctx.current_blob_block_offset + ctx.current_part_blob_offset + part_size + info.aligned()
-                    > ctx.block_size
-                {
-                    if let Some(part) = Self::split_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
-                        batch.blocks.last_mut().unwrap().blob_parts.push(part);
-                    }
+                if ctx.current_blob_block_offset + ctx.current_part_blob_offset + part_len > ctx.block_size {
+                    Self::seal_part(
+                        ctx,
+                        &mut batch,
+                        &bytes,
+                        &mut indices,
+                        &mut part_start,
+                        &mut part_end,
+                        true,
+                    );
                     Self::split_block(ctx, &mut batch);
                     continue 'handle;
+                }
+
+                if part_start.is_none() {
+                    part_start = Some(start);
                 }
 
                 let index = BlobEntryIndex {
                     hash: info.hash,
                     sequence: info.sequence,
-                    offset: ctx.current_part_blob_offset as u32 + part_size as u32,
+                    offset: (ctx.current_part_blob_offset + info.offset - start) as u32,
                     len: info.len as u32,
                 };
 
@@ -368,99 +395,74 @@ impl Splitter {
 
                 ctx.current_blob_index.write(&index);
                 indices.push(index);
-                part_size += info.aligned();
+                part_end = part_end.max(info.offset + info.len);
 
                 break 'handle;
             }
         }
 
-        if let Some(part) = Self::seal_blob(ctx, &mut indices, &mut part_size, &mut bytes) {
-            batch.blocks.last_mut().unwrap().blob_parts.push(part);
-        }
+        Self::seal_part(
+            ctx,
+            &mut batch,
+            &bytes,
+            &mut indices,
+            &mut part_start,
+            &mut part_end,
+            false,
+        );
 
         batch
     }
 
-    fn split_blob(
+    fn seal_part(
         ctx: &mut SplitCtx,
+        batch: &mut Batch,
+        bytes: &IoSlice,
         indices: &mut Vec<BlobEntryIndex>,
-        part_size: &mut usize,
-        bytes: &mut IoSlice,
-    ) -> Option<BlobPart> {
-        tracing::trace!("[splitter]: split blob");
-        if indices.is_empty() {
-            // The blob part is empty, only need to set the state.
-            assert_eq!(*part_size, 0);
-            ctx.current_blob_index.reset();
-            ctx.current_blob_block_offset += ctx.current_part_blob_offset;
-            ctx.current_part_blob_offset = ctx.blob_index_size;
-
-            None
-        } else {
-            // Seal and clear the blob index to prepare for the next blob.
-            let index = ctx.current_blob_index.seal();
-            ctx.current_blob_index.reset();
-
-            let indices = std::mem::take(indices);
-
-            let part = BlobPart {
-                blob_block_offset: ctx.current_blob_block_offset,
-                index,
-                part_blob_offset: ctx.current_part_blob_offset,
-                data: bytes.slice(..*part_size),
-                indices,
-            };
-
-            ctx.current_blob_block_offset = ctx.current_blob_block_offset + ctx.current_part_blob_offset + *part_size;
-            ctx.current_part_blob_offset = ctx.blob_index_size;
-            *bytes = bytes.slice(*part_size..);
-            *part_size = 0;
-
-            Some(part)
-        }
-    }
-
-    fn split_block(ctx: &mut SplitCtx, batch: &mut Batch) {
-        tracing::trace!("[splitter]; split block");
-        batch.blocks.push(Block { blob_parts: vec![] });
-        ctx.current_blob_block_offset = 0;
-    }
-
-    fn seal_blob(
-        ctx: &mut SplitCtx,
-        indices: &mut Vec<BlobEntryIndex>,
-        part_size: &mut usize,
-        shared_io_slice: &mut IoSlice,
-    ) -> Option<BlobPart> {
-        tracing::trace!("[splitter]: seal blob");
+        part_start: &mut Option<usize>,
+        part_end: &mut usize,
+        force_new_blob: bool,
+    ) {
+        tracing::trace!("[splitter]: seal part");
 
         if indices.is_empty() {
-            return None;
+            return;
         }
 
-        // Seal the last blob.
+        let start = part_start.take().unwrap();
+        let end = bits::align_up(PAGE, *part_end);
+        let data = bytes.slice(start..end);
         let index = ctx.current_blob_index.seal();
-
         let indices = std::mem::take(indices);
 
         let part = BlobPart {
             blob_block_offset: ctx.current_blob_block_offset,
             index,
             part_blob_offset: ctx.current_part_blob_offset,
-            data: shared_io_slice.slice(..*part_size),
+            data,
             indices,
         };
 
-        if ctx.current_blob_index.is_full() {
-            tracing::trace!("[splitter]: seal blob, split blob because index is full");
+        let part_size = part.data.len();
+        if force_new_blob || ctx.current_blob_index.is_full() {
             ctx.current_blob_index.reset();
-            ctx.current_blob_block_offset = ctx.current_blob_block_offset + ctx.current_part_blob_offset + *part_size;
+            ctx.current_blob_block_offset += ctx.current_part_blob_offset + part_size;
             ctx.current_part_blob_offset = ctx.blob_index_size;
         } else {
-            ctx.current_part_blob_offset += *part_size;
+            ctx.current_part_blob_offset += part_size;
         }
 
-        Some(part)
+        *part_end = 0;
+
+        batch.blocks.last_mut().unwrap().blob_parts.push(part);
+    }
+
+    fn split_block(ctx: &mut SplitCtx, batch: &mut Batch) {
+        tracing::trace!("[splitter]; split block");
+        batch.blocks.push(Block { blob_parts: vec![] });
+        ctx.current_blob_block_offset = 0;
+        ctx.current_part_blob_offset = ctx.blob_index_size;
+        ctx.current_blob_index.reset();
     }
 }
 

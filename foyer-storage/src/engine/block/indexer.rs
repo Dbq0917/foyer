@@ -17,12 +17,15 @@ use std::{
     sync::Arc,
 };
 
-use foyer_common::{error::Result, hasher::ModHasher, spawn::Spawner};
+use foyer_common::{bits, error::Result, hasher::ModHasher, spawn::Spawner};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use parking_lot::RwLock;
 
-use crate::engine::block::{manager::BlockId, serde::Sequence};
+use crate::{
+    engine::block::{manager::BlockId, serde::Sequence},
+    io::PAGE,
+};
 
 #[derive(Debug, Clone)]
 pub enum Index {
@@ -52,6 +55,25 @@ pub struct EntryAddress {
     pub len: u32,
 
     pub sequence: Sequence,
+}
+
+impl EntryAddress {
+    /// Return the page-aligned read offset, read length, and entry offset within the read buffer.
+    pub fn read_range(&self) -> (u32, usize, usize) {
+        let offset = self.offset as usize;
+        let start = bits::align_down(PAGE, offset);
+        let len = bits::align_up(PAGE, offset - start + self.len as usize);
+        (start as u32, len, offset - start)
+    }
+
+    /// Return the approximate invalid space charged to the block when this entry is deleted.
+    pub fn invalid_size(&self) -> usize {
+        if self.len as usize >= PAGE {
+            bits::align_up(PAGE, self.len as usize)
+        } else {
+            self.len as usize
+        }
+    }
 }
 
 type IndexerShard = HashMap<u64, Index, ModHasher>;

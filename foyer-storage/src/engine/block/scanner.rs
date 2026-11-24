@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use foyer_common::error::Result;
+use foyer_common::{bits, error::Result};
 use itertools::Itertools;
 
 use super::indexer::EntryAddress;
 use crate::{
     engine::block::{buffer::BlobIndexReader, manager::Block},
-    io::bytes::IoSliceMut,
+    io::{PAGE, bytes::IoSliceMut},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,8 +64,10 @@ impl BlockScanner {
         };
 
         let step = indices
-            .last()
-            .map(|index| index.offset as u64 + index.aligned() as u64)
+            .iter()
+            .map(|index| index.offset as usize + index.len as usize)
+            .max()
+            .map(|end| bits::align_up(PAGE, end) as u64)
             .unwrap_or(self.block.size() as u64);
 
         tracing::trace!(

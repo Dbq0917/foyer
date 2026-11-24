@@ -75,8 +75,9 @@ use crate::{
 ///
 /// The block-based disk cache engine is suitable for general cache entries with size from 2K to hundreds of MiBs.
 ///
-/// Each cache entry will be aligned to a multiplier of 4K on disk, hence too small cache entries will lead to heavy
-/// internal fragmentation.
+/// Entries smaller than a page are packed together within the same page. An entry never crosses a page boundary, so
+/// small entries still cost one page-sized read and packing does not increase read amplification. Entries larger than
+/// a page start at a page boundary.
 ///
 /// The disk cache evicts cache entries in block unit.
 pub struct BlockEngineConfig<K, V, P>
@@ -641,8 +642,9 @@ where
                 return Ok(Load::Throttled);
             }
 
-            let buf = IoSliceMut::new(bits::align_up(PAGE, addr.len as _));
-            let (buf, res) = block.read(Box::new(buf), addr.offset as _).await;
+            let (read_offset, read_len, entry_offset) = addr.read_range();
+            let buf = IoSliceMut::new(read_len);
+            let (buf, res) = block.read(Box::new(buf), read_offset as _).await;
             match res {
                 Ok(_) => {}
                 Err(e) => {
@@ -651,7 +653,8 @@ where
                 }
             }
 
-            let header = match EntryHeader::read(&buf[..EntryHeader::serialized_len()]) {
+            let entry = &buf[entry_offset..entry_offset + addr.len as usize];
+            let header = match EntryHeader::read(&entry[..EntryHeader::serialized_len()]) {
                 Ok(header) => header,
                 Err(e) => {
                     return match e.kind() {
@@ -679,7 +682,7 @@ where
             let (key, value) = {
                 let now = Instant::now();
                 let res = match EntryDeserializer::deserialize::<K, V>(
-                    &buf[EntryHeader::serialized_len()..],
+                    &entry[EntryHeader::serialized_len()..],
                     header.key_len as _,
                     header.value_len as _,
                     header.compression,
@@ -743,7 +746,7 @@ where
             .insert_tombstone(hash, sequence)
             .map(|addr| InvalidStats {
                 block: addr.block,
-                size: bits::align_up(PAGE, addr.len as usize),
+                size: addr.invalid_size(),
             });
 
         let this = self.clone();
@@ -890,9 +893,55 @@ mod tests {
             .build()
     }
 
+    fn cache_for_test_with_capacity(capacity: usize) -> Cache<u64, Vec<u8>, ModHasher, TestProperties> {
+        CacheBuilder::new(capacity)
+            .with_shards(1)
+            .with_eviction_config(FifoConfig::default())
+            .with_hash_builder(ModHasher::default())
+            .build()
+    }
+
     /// 4 files, fifo eviction, 16 KiB block, 64 KiB capacity.
     async fn engine_for_test(dir: impl AsRef<Path>) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
         store_for_test_with_reinsertion_filter(dir, StorageFilter::new().with_condition(RejectAll)).await
+    }
+
+    async fn store_for_test_with_size(
+        dir: impl AsRef<Path>,
+        capacity: usize,
+        block_size: usize,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        let device = FsDeviceBuilder::new(dir).with_capacity(capacity).build().unwrap();
+        let builder = BlockEngineConfig {
+            device,
+            block_size,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter: StorageFilter::new().with_condition(RejectAll),
+            enable_tombstone_log: false,
+            buffer_pool_size: 16 * 1024 * 1024,
+            blob_index_size: 4 * 1024,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+
+        Box::new(builder)
+            .build(EngineBuildContext {
+                io_engine_config: PsyncIoEngineConfig::new().boxed(),
+                metrics: Arc::new(Metrics::noop()),
+                spawner: Spawner::current(),
+                recover_mode: RecoverMode::Strict,
+            })
+            .await
+            .unwrap()
     }
 
     async fn store_for_test_with_reinsertion_filter(
@@ -1080,6 +1129,45 @@ mod tests {
         assert_eq!(r5, (5, vec![5; 11 * KB]));
         let r6 = store.load(memory.hash(&6)).await.unwrap().kv().unwrap();
         assert_eq!(r6, (6, vec![6; 7 * KB]));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_small_entries_are_packed_without_read_amplification() {
+        const ENTRIES: usize = 1024;
+        const VALUE_SIZE: usize = 384;
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test_with_capacity(ENTRIES * 2);
+        let capacity = 16 * 64 * KB;
+        let store = store_for_test_with_size(dir.path(), capacity, 64 * KB).await;
+
+        for i in 0..ENTRIES {
+            let e = memory.insert(i as u64, vec![i as u8; VALUE_SIZE]);
+            enqueue(&store, e);
+        }
+        store.wait().await;
+
+        let mut remains = 0;
+        for i in 0..ENTRIES {
+            if store.load(memory.hash(&(i as u64))).await.unwrap().kv().is_some() {
+                remains += 1;
+            }
+        }
+        assert_eq!(remains, ENTRIES);
+
+        let before = store.statistics().disk_read_bytes();
+        let value = store.load(memory.hash(&0)).await.unwrap().kv().unwrap();
+        assert_eq!(value, (0, vec![0; VALUE_SIZE]));
+        assert_eq!(store.statistics().disk_read_bytes() - before, PAGE);
+
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = store_for_test_with_size(dir.path(), capacity, 64 * KB).await;
+        for i in 0..ENTRIES {
+            let value = store.load(memory.hash(&(i as u64))).await.unwrap().kv();
+            assert_eq!(value, Some((i as u64, vec![i as u8; VALUE_SIZE])));
+        }
     }
 
     #[test_log::test(tokio::test)]
