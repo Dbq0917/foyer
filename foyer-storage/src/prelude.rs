@@ -19,6 +19,7 @@ pub use crate::{
     engine::{
         Engine, EngineBuildContext, EngineConfig, Load, Populated, RecoverMode,
         block::{
+            commit_slot::{CommittedSlot, SlotBank, SlotCommit, SlotLayout, read_committed},
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
             manager::{Block, BlockStatistics},

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod buffer;
+pub mod commit_slot;
 pub mod engine;
 pub mod eviction;
 pub mod flusher;

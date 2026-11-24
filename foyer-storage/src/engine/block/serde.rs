@@ -82,3 +82,52 @@ impl EntryHeader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serde::{Checksummer, EntryDeserializer};
+
+    #[test]
+    fn stale_header_does_not_return_concatenated_tail() {
+        let old_value = vec![0xa5; 64];
+        let old_key = vec![0x5a; 8];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&old_value);
+        payload.extend_from_slice(&old_key);
+
+        let header = EntryHeader {
+            key_len: old_key.len() as u32,
+            value_len: old_value.len() as u32,
+            hash: 7,
+            sequence: 9,
+            checksum: Checksummer::checksum64(&payload),
+            compression: Compression::None,
+        };
+
+        let mut buf = vec![0; EntryHeader::serialized_len() + payload.len()];
+        header.write(&mut buf[..EntryHeader::serialized_len()]);
+        buf[EntryHeader::serialized_len()..].copy_from_slice(&payload);
+
+        // A shorter replacement overwrites the prefix, but power loss prevents
+        // the header from being committed. The stale header must never produce
+        // a value made from the new prefix plus the old tail.
+        let new_value = vec![0x11; 3];
+        let new_key = vec![0x22; 1];
+        let header_len = EntryHeader::serialized_len();
+        buf[header_len..header_len + new_value.len()].copy_from_slice(&new_value);
+        buf[header_len + new_value.len()..header_len + new_value.len() + new_key.len()].copy_from_slice(&new_key);
+
+        let stale_header = EntryHeader::read(&buf[..EntryHeader::serialized_len()]).unwrap();
+        let err = EntryDeserializer::deserialize::<Vec<u8>, Vec<u8>>(
+            &buf[EntryHeader::serialized_len()..],
+            stale_header.key_len as _,
+            stale_header.value_len as _,
+            stale_header.compression,
+            Some(stale_header.checksum),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ChecksumMismatch);
+    }
+}
